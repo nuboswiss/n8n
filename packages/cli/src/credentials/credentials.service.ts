@@ -10,7 +10,7 @@ import {
 	UserRepository,
 } from '@n8n/db';
 import { Service } from '@n8n/di';
-import { hasGlobalScope, type Scope } from '@n8n/permissions';
+import { hasGlobalScope, PROJECT_OWNER_ROLE_SLUG, type Scope } from '@n8n/permissions';
 // eslint-disable-next-line n8n-local-rules/misplaced-n8n-typeorm-import
 import {
 	In,
@@ -23,9 +23,19 @@ import type {
 	ICredentialDataDecryptedObject,
 	ICredentialsDecrypted,
 	ICredentialType,
+	IDataObject,
 	INodeProperties,
+	INodePropertyCollection,
 } from 'n8n-workflow';
-import { CREDENTIAL_EMPTY_VALUE, deepCopy, NodeHelpers, UnexpectedError } from 'n8n-workflow';
+import {
+	CREDENTIAL_EMPTY_VALUE,
+	deepCopy,
+	isINodePropertyCollection,
+	NodeHelpers,
+	UnexpectedError,
+} from 'n8n-workflow';
+
+import { CredentialsFinderService } from './credentials-finder.service';
 
 import { CREDENTIAL_BLANKING_VALUE } from '@/constants';
 import { CredentialTypes } from '@/credential-types';
@@ -38,11 +48,8 @@ import { userHasScopes } from '@/permissions.ee/check-access';
 import type { CredentialRequest, ListQuery } from '@/requests';
 import { CredentialsTester } from '@/services/credentials-tester.service';
 import { OwnershipService } from '@/services/ownership.service';
-// eslint-disable-next-line import-x/no-cycle
 import { ProjectService } from '@/services/project.service.ee';
 import { RoleService } from '@/services/role.service';
-
-import { CredentialsFinderService } from './credentials-finder.service';
 
 export type CredentialsGetSharedOptions =
 	| { allowGlobalScope: true; globalScope: Scope }
@@ -300,7 +307,7 @@ export class CredentialsService {
 				role: 'credential:owner',
 				project: {
 					projectRelations: {
-						role: 'project:personalOwner',
+						role: { slug: PROJECT_OWNER_ROLE_SLUG },
 						userId: user.id,
 					},
 				},
@@ -388,7 +395,6 @@ export class CredentialsService {
 		await this.externalHooks.run('credentials.update', [newCredentialData]);
 
 		// Update the credentials in DB
-		// @ts-ignore CAT-957
 		await this.credentialsRepository.update(credentialId, newCredentialData);
 
 		// We sadly get nothing back from "update". Neither if it updated a record
@@ -410,10 +416,6 @@ export class CredentialsService {
 
 		const { manager: dbManager } = this.credentialsRepository;
 		const result = await dbManager.transaction(async (transactionManager) => {
-			const savedCredential = await transactionManager.save<CredentialsEntity>(newCredential);
-
-			savedCredential.data = newCredential.data;
-
 			const project =
 				projectId === undefined
 					? await this.projectRepository.getPersonalProjectForUserOrFail(
@@ -437,6 +439,10 @@ export class CredentialsService {
 			if (project === null) {
 				throw new UnexpectedError('No personal project found');
 			}
+
+			const savedCredential = await transactionManager.save<CredentialsEntity>(newCredential);
+
+			savedCredential.data = newCredential.data;
 
 			const newSharedCredential = this.sharedCredentialsRepository.create({
 				role: 'credential:owner',
@@ -508,34 +514,63 @@ export class CredentialsService {
 			return props;
 		};
 		const properties = getExtendedProps(credType);
+		return this.redactValues(copiedData, properties);
+	}
 
-		for (const dataKey of Object.keys(copiedData)) {
+	private redactValues(data: ICredentialDataDecryptedObject, props: INodeProperties[]) {
+		for (const dataKey of Object.keys(data)) {
 			// The frontend only cares that this value isn't falsy.
 			if (dataKey === 'oauthTokenData' || dataKey === 'csrfSecret') {
-				if (copiedData[dataKey].toString().length > 0) {
-					copiedData[dataKey] = CREDENTIAL_BLANKING_VALUE;
+				if (data[dataKey].toString().length > 0) {
+					data[dataKey] = CREDENTIAL_BLANKING_VALUE;
 				} else {
-					copiedData[dataKey] = CREDENTIAL_EMPTY_VALUE;
+					data[dataKey] = CREDENTIAL_EMPTY_VALUE;
 				}
 				continue;
 			}
-			const prop = properties.find((v) => v.name === dataKey);
+
+			const prop = props.find((v) => v.name === dataKey);
 			if (!prop) {
 				continue;
 			}
+
+			if (prop.type === 'fixedCollection' && prop.options?.length) {
+				const dataObject = data[dataKey] as IDataObject;
+				for (const option of prop.options) {
+					if (isINodePropertyCollection(option)) {
+						this.redactCollectionOption(dataObject, option);
+					}
+				}
+			}
+
 			if (
 				prop.typeOptions?.password &&
-				(!(copiedData[dataKey] as string).startsWith('={{') || prop.noDataExpression)
+				(!(data[dataKey] as string).startsWith('={{') || prop.noDataExpression)
 			) {
-				if (copiedData[dataKey].toString().length > 0) {
-					copiedData[dataKey] = CREDENTIAL_BLANKING_VALUE;
+				if (data[dataKey].toString().length > 0) {
+					data[dataKey] = CREDENTIAL_BLANKING_VALUE;
 				} else {
-					copiedData[dataKey] = CREDENTIAL_EMPTY_VALUE;
+					data[dataKey] = CREDENTIAL_EMPTY_VALUE;
 				}
 			}
 		}
 
-		return copiedData;
+		return data;
+	}
+
+	private redactCollectionOption(data: IDataObject, option: INodePropertyCollection) {
+		const collectionValuesKey = option.name;
+		const values = data?.[collectionValuesKey];
+		if (Array.isArray(values)) {
+			for (let i = 0; i < values.length; i++) {
+				values[i] = this.redactValues(values[i] as ICredentialDataDecryptedObject, option.values);
+			}
+		} else if (typeof values === 'object' && values !== null) {
+			data[collectionValuesKey] = this.redactValues(
+				values as ICredentialDataDecryptedObject,
+				option.values,
+			);
+		}
 	}
 
 	private unredactRestoreValues(unmerged: any, replacement: any) {
